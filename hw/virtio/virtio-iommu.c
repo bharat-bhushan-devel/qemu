@@ -522,16 +522,23 @@ static IOMMUTLBEntry virtio_iommu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     VirtIOIOMMUEndpoint *ep;
     uint32_t sid, flags;
     bool bypass_allowed;
+    hwaddr addr_mask;
     bool found;
 
     interval.low = addr;
     interval.high = addr + 1;
 
+    if (sdev->page_size_mask) {
+        addr_mask = (1 << ctz32(sdev->page_size_mask)) - 1;
+    } else {
+        addr_mask = (1 << ctz32(s->config.page_size_mask)) - 1;
+    }
+
     IOMMUTLBEntry entry = {
         .target_as = &address_space_memory,
         .iova = addr,
         .translated_addr = addr,
-        .addr_mask = (1 << ctz32(s->config.page_size_mask)) - 1,
+        .addr_mask = addr_mask,
         .perm = IOMMU_NONE,
     };
 
@@ -648,6 +655,19 @@ static gint int_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
     guint ua = GPOINTER_TO_UINT(a);
     guint ub = GPOINTER_TO_UINT(b);
     return (ua > ub) - (ua < ub);
+}
+
+static int virtio_iommu_set_page_size_mask(IOMMUMemoryRegion *mr,
+                                           uint64_t page_size_mask)
+{
+    IOMMUDevice *sdev = container_of(mr, IOMMUDevice, iommu_mr);
+
+    if (sdev->page_size_mask && (sdev->page_size_mask != page_size_mask)) {
+        return -1;
+    }
+
+    sdev->page_size_mask = page_size_mask;
+    return 0;
 }
 
 static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
@@ -865,6 +885,7 @@ static void virtio_iommu_memory_region_class_init(ObjectClass *klass,
     IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
 
     imrc->translate = virtio_iommu_translate;
+    imrc->iommu_set_page_size_mask = virtio_iommu_set_page_size_mask;
 }
 
 static const TypeInfo virtio_iommu_info = {
