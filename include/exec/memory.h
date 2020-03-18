@@ -355,6 +355,18 @@ typedef struct IOMMUMemoryRegionClass {
      * @iommu: the IOMMUMemoryRegion
      */
     int (*num_indexes)(IOMMUMemoryRegion *iommu);
+
+    /*
+     * Set supported IOMMU page size
+     *
+     * Optional method: : If supported, allows to restrict the page size
+     * mask that can be supported with a given IOMMU memory region.
+     * For example, this allows to propagate host physical IOMMU page
+     * size mask limitations to the virtual IOMMU (vfio assignment with
+     * virtual iommu).
+     */
+     int (*iommu_set_page_size_mask)(IOMMUMemoryRegion *iommu,
+                                     uint64_t page_size_mask);
 } IOMMUMemoryRegionClass;
 
 typedef struct CoalescedMemoryRange CoalescedMemoryRange;
@@ -1362,6 +1374,16 @@ int memory_region_iommu_attrs_to_index(IOMMUMemoryRegion *iommu_mr,
  * @iommu_mr: the memory region
  */
 int memory_region_iommu_num_indexes(IOMMUMemoryRegion *iommu_mr);
+
+/**
+ * memory_region_iommu_set_page_size_mask: set the supported page
+ * sizes for a given IOMMU memory region
+ *
+ * @iommu_mr: the memory region
+ * @page_size_mask: supported page size mask
+ */
+int memory_region_iommu_set_page_size_mask(IOMMUMemoryRegion *iommu_mr,
+                                           uint64_t page_size_mask);
 
 /**
  * memory_region_name: get a memory region's name
