@@ -111,12 +111,19 @@ struct virtio_iommu_req_unmap {
 
 #define VIRTIO_IOMMU_PROBE_T_NONE		0
 #define VIRTIO_IOMMU_PROBE_T_RESV_MEM		1
+#define VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK	2
 
 #define VIRTIO_IOMMU_PROBE_T_MASK		0xfff
 
 struct virtio_iommu_probe_property {
 	uint16_t					type;
 	uint16_t					length;
+};
+
+struct virtio_iommu_probe_pgsize_mask {
+	struct virtio_iommu_probe_property	head;
+	uint8_t					reserved[4];
+	uint64_t					pgsize_bitmap;
 };
 
 #define VIRTIO_IOMMU_RESV_MEM_T_RESERVED	0
