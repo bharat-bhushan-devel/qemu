@@ -38,6 +38,10 @@
 
 /* Max size */
 #define VIOMMU_DEFAULT_QUEUE_SIZE 256
+#define VIOMMU_PROBE_SIZE 512
+
+#define SUPPORTED_PROBE_PROPERTIES (\
+    1 << VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK)
 
 typedef struct VirtIOIOMMUDomain {
     uint32_t id;
@@ -61,6 +65,13 @@ typedef struct VirtIOIOMMUMapping {
     uint64_t phys_addr;
     uint32_t flags;
 } VirtIOIOMMUMapping;
+
+typedef struct VirtIOIOMMUPropBuffer {
+    VirtIOIOMMUEndpoint *endpoint;
+    size_t filled;
+    uint8_t *start;
+    bool error;
+} VirtIOIOMMUPropBuffer;
 
 static inline uint16_t virtio_iommu_get_bdf(IOMMUDevice *dev)
 {
@@ -490,6 +501,130 @@ static int virtio_iommu_unmap(VirtIOIOMMU *s,
     return ret;
 }
 
+static int virtio_iommu_fill_none_prop(VirtIOIOMMUPropBuffer *bufstate)
+{
+    struct virtio_iommu_probe_property *prop;
+
+    prop = (struct virtio_iommu_probe_property *)
+                (bufstate->start + bufstate->filled);
+    prop->type = 0;
+    prop->length = 0;
+    bufstate->filled += sizeof(*prop);
+    trace_virtio_iommu_fill_none_property(bufstate->endpoint->id);
+    return 0;
+}
+
+static uint64_t virtio_iommu_get_ep_page_size_mask(VirtIOIOMMUEndpoint *ep)
+{
+    VirtIOIOMMU *s = ep->viommu;
+    IOMMUDevice *sdev;
+
+    QLIST_FOREACH(sdev, &s->notifiers_list, next) {
+        if (ep->id == sdev->devfn) {
+            return sdev->page_size_mask;
+	}
+    }
+
+    return 0;
+}
+
+static int virtio_iommu_fill_page_size_mask(VirtIOIOMMUPropBuffer *bufstate)
+{
+    struct virtio_iommu_probe_pgsize_mask *prop_buf;
+    size_t prop_size = sizeof(*prop_buf);
+    uint64_t page_size_mask;
+
+    page_size_mask = virtio_iommu_get_ep_page_size_mask(bufstate->endpoint);
+
+    /*
+     * Not filling page_size_mask property when page-size-mask for endpoint
+     * not set. Return false to continue traversal.
+     */
+    if (!page_size_mask) {
+           return false;
+    }
+
+    if (bufstate->filled + prop_size >= VIOMMU_PROBE_SIZE) {
+        bufstate->error = true;
+        /* get the traversal stopped by returning true */
+        return true;
+    }
+
+    prop_buf = (struct virtio_iommu_probe_pgsize_mask *)
+                     (bufstate->start + bufstate->filled);
+
+    prop_buf->head.type = VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK;
+    prop_buf->head.length = prop_size;
+    prop_buf->pgsize_bitmap = page_size_mask;
+    bufstate->filled += sizeof(*prop_buf);
+    trace_virtio_iommu_fill_pgsize_mask_property(bufstate->endpoint->id,
+                                                 prop_buf->pgsize_bitmap,
+                                                 bufstate->filled);
+    return false;
+}
+
+/* Fill the properties[] buffer with properties of type @type */
+static int virtio_iommu_fill_property(int type,
+                                      VirtIOIOMMUPropBuffer *bufstate)
+{
+    int ret = -ENOSPC;
+
+    if (bufstate->filled + sizeof(struct virtio_iommu_probe_property)
+            >= VIOMMU_PROBE_SIZE) {
+        /* no space left for the header */
+        bufstate->error = true;
+        goto out;
+    }
+
+    switch (type) {
+    case VIRTIO_IOMMU_PROBE_T_NONE:
+        ret = virtio_iommu_fill_none_prop(bufstate);
+        break;
+    case VIRTIO_IOMMU_PROBE_T_PAGE_SIZE_MASK:
+        ret = virtio_iommu_fill_page_size_mask(bufstate);
+	break;
+    default:
+        ret = -ENOENT;
+        break;
+    }
+out:
+    if (ret) {
+        error_report("%s property of type=%d could not be filled (%d),"
+                     " remaining size = 0x%lx",
+                     __func__, type, ret, bufstate->filled);
+    }
+    return ret;
+}
+
+/**
+ * virtio_iommu_probe - Fill the probe request buffer with all
+ * the properties the device is able to return and add a NONE
+ * property at the end. @buf points to properties[].
+ */
+static int virtio_iommu_probe(VirtIOIOMMU *s,
+                              struct virtio_iommu_req_probe *req,
+                              uint8_t *buf)
+{
+    uint32_t ep_id = le32_to_cpu(req->endpoint);
+    VirtIOIOMMUEndpoint *ep = virtio_iommu_get_endpoint(s, ep_id);
+    int16_t prop_types = SUPPORTED_PROBE_PROPERTIES, type;
+    VirtIOIOMMUPropBuffer bufstate = {.start = buf, .filled = 0,
+                                       .error = false, .endpoint = ep};
+
+    while ((type = ctz32(prop_types)) != 32) {
+        if (virtio_iommu_fill_property(type, &bufstate)) {
+            goto failure;
+        }
+        prop_types &= ~(1 << type);
+    }
+    if (virtio_iommu_fill_property(VIRTIO_IOMMU_PROBE_T_NONE, &bufstate)) {
+        goto failure;
+    }
+    return VIRTIO_IOMMU_S_OK;
+failure:
+    return VIRTIO_IOMMU_S_INVAL;
+}
+
 static int virtio_iommu_iov_to_req(struct iovec *iov,
                                    unsigned int iov_cnt,
                                    void *req, size_t req_sz)
@@ -518,6 +653,17 @@ virtio_iommu_handle_req(attach)
 virtio_iommu_handle_req(detach)
 virtio_iommu_handle_req(map)
 virtio_iommu_handle_req(unmap)
+
+static int virtio_iommu_handle_probe(VirtIOIOMMU *s,
+                                     struct iovec *iov,
+                                     unsigned int iov_cnt,
+                                     uint8_t *buf)
+{
+    struct virtio_iommu_req_probe req;
+    int ret = virtio_iommu_iov_to_req(iov, iov_cnt, &req, sizeof(req));
+
+    return ret ? ret : virtio_iommu_probe(s, &req, buf);
+}
 
 static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
 {
@@ -564,17 +710,33 @@ static void virtio_iommu_handle_command(VirtIODevice *vdev, VirtQueue *vq)
         case VIRTIO_IOMMU_T_UNMAP:
             tail.status = virtio_iommu_handle_unmap(s, iov, iov_cnt);
             break;
+        case VIRTIO_IOMMU_T_PROBE:
+        {
+            struct virtio_iommu_req_tail *ptail;
+            uint8_t *buf = g_malloc0(s->config.probe_size + sizeof(tail));
+
+            ptail = (struct virtio_iommu_req_tail *)
+                        (buf + s->config.probe_size);
+            ptail->status = virtio_iommu_handle_probe(s, iov, iov_cnt, buf);
+
+            sz = iov_from_buf(elem->in_sg, elem->in_num, 0,
+                              buf, s->config.probe_size + sizeof(tail));
+            g_free(buf);
+            assert(sz == s->config.probe_size + sizeof(tail));
+            goto push;
+        }
         default:
             tail.status = VIRTIO_IOMMU_S_UNSUPP;
         }
-        qemu_mutex_unlock(&s->mutex);
 
 out:
         sz = iov_from_buf(elem->in_sg, elem->in_num, 0,
                           &tail, sizeof(tail));
         assert(sz == sizeof(tail));
 
-        virtqueue_push(vq, elem, sizeof(tail));
+push:
+        qemu_mutex_unlock(&s->mutex);
+        virtqueue_push(vq, elem, sz);
         virtio_notify(vdev, vq);
         g_free(elem);
     }
@@ -843,6 +1005,7 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     s->config.page_size_mask = TARGET_PAGE_MASK;
     s->config.input_range.end = -1UL;
     s->config.domain_range.end = 32;
+    s->config.probe_size = VIOMMU_PROBE_SIZE;
 
     virtio_add_feature(&s->features, VIRTIO_RING_F_EVENT_IDX);
     virtio_add_feature(&s->features, VIRTIO_RING_F_INDIRECT_DESC);
@@ -852,6 +1015,7 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MAP_UNMAP);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_BYPASS);
     virtio_add_feature(&s->features, VIRTIO_IOMMU_F_MMIO);
+    virtio_add_feature(&s->features, VIRTIO_IOMMU_F_PROBE);
 
     qemu_mutex_init(&s->mutex);
 
